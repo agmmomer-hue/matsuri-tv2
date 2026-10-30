@@ -1,0 +1,355 @@
+name: Build Matsuri TV APK
+
+# Single-file workflow: downloads the original Matsuri source, adds the remote
+# mouse-pointer feature, builds it and uploads the APKs.
+# Run: Actions -> "Build Matsuri TV APK" -> Run workflow
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: Matsuri
+    env:
+      # Throw-away signing key (generated below). Uninstall the old build
+      # before installing a newer one, as signatures differ between runs.
+      KEYSTORE_PASS: matsuri-ci-pass
+      ALIAS_NAME: matsuri
+      ALIAS_PASS: matsuri-ci-pass
+      BUILD_PLUGIN: none
+    steps:
+      - name: Get Matsuri source
+        working-directory: .
+        run: git clone --depth 1 https://github.com/MatsuriDayo/Matsuri.git
+
+      - name: Add remote mouse-pointer feature
+        run: |
+          mkdir -p app/src/main/java/moe/matsuri/nya/ui
+          cat > app/src/main/java/moe/matsuri/nya/ui/RemoteCursor.kt <<'KTEOF'
+          package moe.matsuri.nya.ui
+
+          import android.app.Activity
+          import android.app.UiModeManager
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.content.res.Configuration
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.os.SystemClock
+          import android.view.KeyEvent
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.Toast
+          import kotlin.math.min
+
+          /**
+           * Virtual mouse pointer for TV remotes (e.g. Xiaomi Mi Box).
+           *
+           * - MENU key toggles the pointer on/off.
+           * - D-pad moves the pointer (accelerates while held).
+           * - OK / ENTER acts as a touch (press = down, release = up, hold = long press).
+           * - Moving up/down while the pointer is at the top/bottom edge scrolls the content.
+           *
+           * BACK and HOME are never consumed.
+           */
+          class RemoteCursor(private val activity: Activity) {
+
+              companion object {
+                  // Position is shared so the pointer stays in place when switching screens.
+                  private var lastX = -1f
+                  private var lastY = -1f
+                  private var lastEnabled = false
+
+                  fun isTvDevice(context: Context): Boolean {
+                      val ui = context.getSystemService(Context.UI_MODE_SERVICE) as? UiModeManager
+                      if (ui?.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION) return true
+                      return !context.packageManager.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN)
+                  }
+              }
+
+              private val density = activity.resources.displayMetrics.density
+              private var view: CursorView? = null
+              private var enabled = lastEnabled
+              private var touching = false
+              private var downTime = 0L
+
+              fun attach() {
+                  if (view != null) return
+                  val decor = activity.window.decorView as? ViewGroup ?: return
+                  val v = CursorView(activity, density)
+                  v.visibility = if (enabled) View.VISIBLE else View.GONE
+                  decor.addView(v, ViewGroup.LayoutParams(-1, -1))
+                  view = v
+                  decor.post { ensureInitialPosition(decor) }
+              }
+
+              private fun ensureInitialPosition(decor: View) {
+                  if (lastX < 0f || lastY < 0f) {
+                      lastX = decor.width / 2f
+                      lastY = decor.height / 2f
+                  }
+                  clampAndShow(decor)
+              }
+
+              private fun clampAndShow(decor: View) {
+                  lastX = lastX.coerceIn(0f, (decor.width - 1).toFloat())
+                  lastY = lastY.coerceIn(0f, (decor.height - 1).toFloat())
+                  view?.setPointer(lastX, lastY)
+              }
+
+              /** Returns true if the event was consumed. */
+              fun handle(event: KeyEvent): Boolean {
+                  val decor = activity.window.decorView
+                  val code = event.keyCode
+
+                  if (code == KeyEvent.KEYCODE_MENU) {
+                      if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) toggle(decor)
+                      return true
+                  }
+
+                  if (!enabled) return false
+
+                  when (code) {
+                      KeyEvent.KEYCODE_DPAD_UP,
+                      KeyEvent.KEYCODE_DPAD_DOWN,
+                      KeyEvent.KEYCODE_DPAD_LEFT,
+                      KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                          if (event.action == KeyEvent.ACTION_DOWN) move(decor, code, event.repeatCount)
+                          return true
+                      }
+                      KeyEvent.KEYCODE_DPAD_CENTER,
+                      KeyEvent.KEYCODE_ENTER,
+                      KeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                          if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                              sendTouch(MotionEvent.ACTION_DOWN, lastX, lastY)
+                          } else if (event.action == KeyEvent.ACTION_UP) {
+                              sendTouch(MotionEvent.ACTION_UP, lastX, lastY)
+                          }
+                          return true
+                      }
+                  }
+                  return false
+              }
+
+              private fun toggle(decor: View) {
+                  // Release any touch left pressed.
+                  if (touching) sendTouch(MotionEvent.ACTION_CANCEL, lastX, lastY)
+                  enabled = !enabled
+                  lastEnabled = enabled
+                  view?.visibility = if (enabled) View.VISIBLE else View.GONE
+                  if (enabled) clampAndShow(decor)
+                  Toast.makeText(
+                      activity,
+                      if (enabled) "Mouse mode ON (MENU to turn off)" else "Mouse mode OFF",
+                      Toast.LENGTH_SHORT
+                  ).show()
+              }
+
+              private fun move(decor: View, code: Int, repeat: Int) {
+                  // 10dp per step, up to ~5x faster when held.
+                  val step = 10f * density * (1f + min(repeat, 25) / 6f)
+                  val maxX = (decor.width - 1).toFloat()
+                  val maxY = (decor.height - 1).toFloat()
+                  val edge = 2f * density
+
+                  when (code) {
+                      KeyEvent.KEYCODE_DPAD_LEFT -> lastX -= step
+                      KeyEvent.KEYCODE_DPAD_RIGHT -> lastX += step
+                      KeyEvent.KEYCODE_DPAD_UP -> {
+                          if (lastY <= edge) swipe(decor, down = true) else lastY -= step
+                      }
+                      KeyEvent.KEYCODE_DPAD_DOWN -> {
+                          if (lastY >= maxY - edge) swipe(decor, down = false) else lastY += step
+                      }
+                  }
+                  lastX = lastX.coerceIn(0f, maxX)
+                  lastY = lastY.coerceIn(0f, maxY)
+                  view?.setPointer(lastX, lastY)
+              }
+
+              /** Drag gesture at the pointer's x to scroll content (down=true scrolls toward the top). */
+              private fun swipe(decor: View, down: Boolean) {
+                  val dist = decor.height * 0.35f
+                  val startY = decor.height / 2f - (if (down) dist / 2f else -dist / 2f)
+                  val endY = if (down) startY + dist else startY - dist
+                  val x = lastX
+                  val t0 = SystemClock.uptimeMillis()
+                  val steps = 6
+                  sendRaw(t0, t0, MotionEvent.ACTION_DOWN, x, startY)
+                  for (i in 1..steps) {
+                      val y = startY + (endY - startY) * i / steps
+                      val t = t0 + i * 16L
+                      sendRaw(t0, t, MotionEvent.ACTION_MOVE, x, y)
+                  }
+                  sendRaw(t0, t0 + (steps + 1) * 16L, MotionEvent.ACTION_UP, x, endY)
+              }
+
+              private fun sendTouch(action: Int, x: Float, y: Float) {
+                  val now = SystemClock.uptimeMillis()
+                  if (action == MotionEvent.ACTION_DOWN) {
+                      downTime = now
+                      touching = true
+                  } else {
+                      touching = false
+                  }
+                  sendRaw(downTime, now, action, x, y)
+              }
+
+              private fun sendRaw(down: Long, time: Long, action: Int, x: Float, y: Float) {
+                  val ev = MotionEvent.obtain(down, time, action, x, y, 0)
+                  ev.source = android.view.InputDevice.SOURCE_TOUCHSCREEN
+                  try {
+                      activity.dispatchTouchEvent(ev)
+                  } finally {
+                      ev.recycle()
+                  }
+              }
+
+              private class CursorView(context: Context, private val d: Float) : View(context) {
+                  private var px = 0f
+                  private var py = 0f
+                  private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.WHITE
+                      style = Paint.Style.FILL
+                  }
+                  private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.BLACK
+                      style = Paint.Style.STROKE
+                      strokeWidth = 1.5f * d
+                      strokeJoin = Paint.Join.ROUND
+                  }
+                  private val path = Path()
+
+                  init {
+                      isClickable = false
+                      isFocusable = false
+                      importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
+                      // Keep above everything in the decor view.
+                      elevation = 100f * d
+                  }
+
+                  fun setPointer(x: Float, y: Float) {
+                      px = x
+                      py = y
+                      invalidate()
+                  }
+
+                  override fun onDraw(canvas: Canvas) {
+                      // Classic arrow, tip at (px, py).
+                      val s = d
+                      path.reset()
+                      path.moveTo(px, py)
+                      path.lineTo(px, py + 20f * s)
+                      path.lineTo(px + 5f * s, py + 15f * s)
+                      path.lineTo(px + 9f * s, py + 23f * s)
+                      path.lineTo(px + 12f * s, py + 22f * s)
+                      path.lineTo(px + 8f * s, py + 14f * s)
+                      path.lineTo(px + 15f * s, py + 14f * s)
+                      path.close()
+                      canvas.drawPath(path, fill)
+                      canvas.drawPath(path, stroke)
+                  }
+
+                  override fun onTouchEvent(event: MotionEvent): Boolean = false
+              }
+          }
+          KTEOF
+          python3 - <<'PY'
+          p = "app/src/main/java/io/nekohasekai/sagernet/ui/ThemedActivity.kt"
+          s = open(p).read()
+          def rep(old, new):
+              global s
+              assert old in s, "pattern not found: " + old
+              s = s.replace(old, new, 1)
+          rep("import android.os.Bundle\n", "import android.os.Bundle\nimport android.view.KeyEvent\n")
+          rep("import io.nekohasekai.sagernet.utils.Theme\n", "import io.nekohasekai.sagernet.utils.Theme\nimport moe.matsuri.nya.ui.RemoteCursor\n")
+          rep("    open val isDialog = false\n", "    open val isDialog = false\n    private var remoteCursor: RemoteCursor? = null\n")
+          rep("        uiMode = resources.configuration.uiMode\n    }\n", """        uiMode = resources.configuration.uiMode
+              }
+
+              override fun onPostCreate(savedInstanceState: Bundle?) {
+                  super.onPostCreate(savedInstanceState)
+                  if (!isDialog && RemoteCursor.isTvDevice(this)) {
+                      remoteCursor = RemoteCursor(this).also { it.attach() }
+                  }
+              }
+
+              override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+                  if (remoteCursor?.handle(event) == true) return true
+                  return super.dispatchKeyEvent(event)
+              }
+          """)
+          open(p, "w").write(s)
+          PY
+          grep -n "RemoteCursor" app/src/main/java/io/nekohasekai/sagernet/ui/ThemedActivity.kt
+
+      - name: Make scripts executable
+        run: |
+          chmod +x run gradlew
+          find . -name "*.sh" -exec chmod +x {} +
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "11"
+
+      - name: Install Android SDK / NDK components
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platforms;android-32" "build-tools;30.0.3" "ndk;25.0.8775105"
+
+      - name: Cache Golang toolchain
+        uses: actions/cache@v4
+        with:
+          path: Matsuri/build/golang
+          key: go-1.20.3-matsuri
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-matsuri-v1
+
+      - name: Build libcore (Go core)
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/25.0.8775105"
+          ./run init action go
+          ./run lib core
+
+      - name: Prepare Gradle build
+        run: ./run init action gradle
+
+      - name: Generate signing key
+        run: |
+          rm -f release.keystore
+          keytool -genkeypair -v \
+            -keystore release.keystore \
+            -alias "$ALIAS_NAME" \
+            -storepass "$KEYSTORE_PASS" \
+            -keypass "$ALIAS_PASS" \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Matsuri CI, O=Local, C=US"
+
+      - name: Build APKs
+        run: |
+          echo "sdk.dir=${ANDROID_HOME}" > local.properties
+          echo "ndk.dir=${ANDROID_HOME}/ndk/25.0.8775105" >> local.properties
+          ./gradlew app:assembleOssRelease --no-daemon
+          find app/build/outputs/apk -name "*.apk"
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: Matsuri-APKs
+          path: Matsuri/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
